@@ -1,4 +1,4 @@
-#!/usr/bin/python3.11
+#!/usr/bin/env python3.11
 """Desktop-global voice command for STT and TTS.
 
 Press Super+B to start recording, press Super+B again to stop and transcribe.
@@ -11,9 +11,12 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import ctypes
+import ctypes.util
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -55,6 +58,45 @@ DEFAULT_TTS_BACKEND = "kokoro"
 DEFAULT_KOKORO_VOICE = "af_heart"
 SECONDARY_KOKORO_VOICE = "bm_george"
 DEFAULT_KOKORO_LANG = "en-us"
+
+IS_MACOS = sys.platform == "darwin"
+SKHD_CONFIG = Path.home() / ".skhdrc"
+SKHD_BEGIN = "# >>> voicemode hotkeys >>>"
+SKHD_END = "# <<< voicemode hotkeys <<<"
+# skhd spells the Option key "alt" in its config, but nobody's keyboard does, so the
+# bindings carry a separate label for anything a person reads.
+MACOS_STT_BINDING = "cmd + alt - b"
+MACOS_TTS_BINDING = "cmd + alt - t"
+MACOS_STT_LABEL = "Cmd+Option+B (⌘⌥B)"
+MACOS_TTS_LABEL = "Cmd+Option+T (⌘⌥T)"
+MACOS_ACCESSIBILITY_HINT = (
+    "macOS refused the synthetic keystroke. Grant Accessibility to the process that launches "
+    "voicemode (skhd for hotkeys, or Terminal/iTerm when running by hand) under "
+    "System Settings > Privacy & Security > Accessibility, then try again."
+)
+# Homebrew prefixes differ by architecture, so both are probed when the espeak-ng
+# library has to be located by hand.
+MACOS_ESPEAK_LIB_DIRS = ("/opt/homebrew/lib", "/usr/local/lib")
+MACOS_ESPEAK_LIB_NAMES = ("libespeak-ng.dylib", "libespeak-ng.1.dylib")
+MACOS_ESPEAK_HINT = (
+    "No usable espeak-ng library was found. kokoro-onnx normally ships one, so install the "
+    "system library with 'brew install espeak-ng' or point PHONEMIZER_ESPEAK_LIBRARY at a "
+    "libespeak-ng.dylib."
+)
+MACOS_AUTOMATION_HINT = (
+    "macOS refused the Apple event. Allow the launching process to control System Events under "
+    "System Settings > Privacy & Security > Automation."
+)
+MACOS_NOTIFY_SCRIPT = """on run argv
+display notification (item 2 of argv) with title (item 1 of argv)
+end run"""
+MACOS_KEYSTROKE_SCRIPT = """on run argv
+tell application "System Events" to keystroke (item 1 of argv)
+end run"""
+MACOS_COMMAND_KEY_SCRIPT = """on run argv
+tell application "System Events" to keystroke (item 1 of argv) using command down
+end run"""
+MACOS_ACCESSIBILITY_PROBE = 'tell application "System Events" to return UI elements enabled'
 
 
 @dataclass
@@ -316,8 +358,52 @@ def transcribe(model_state: ModelState, wav_path: Path, args: argparse.Namespace
         return text, cpu_state
 
 
+def run_osascript(script: str, *script_args: str, timeout: Optional[float] = None):
+    """Run an AppleScript whose inputs arrive through `argv`.
+
+    Values are passed as process arguments, so text with quotes or backslashes needs
+    no AppleScript escaping.
+    """
+    return subprocess.run(
+        ["osascript", "-e", script, *script_args],
+        capture_output=True,
+        text=True, encoding="utf-8",
+        check=False,
+        timeout=timeout,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def osascript_error(result) -> str:
+    detail = (result.stderr or "").strip() or f"osascript exited {result.returncode}"
+    if "-1743" in detail:
+        return f"{detail}\n{MACOS_AUTOMATION_HINT}"
+    if "-1719" in detail or "assistive access" in detail.lower():
+        return f"{detail}\n{MACOS_ACCESSIBILITY_HINT}"
+    return detail
+
+
+def macos_accessibility_status() -> str:
+    try:
+        result = run_osascript(MACOS_ACCESSIBILITY_PROBE, timeout=10.0)
+    except Exception as exc:
+        return f"unknown ({exc})"
+    if result.returncode == 0:
+        return "granted" if result.stdout.strip() == "true" else "denied"
+    detail = (result.stderr or "").strip()
+    if "-1743" in detail:
+        return "automation permission missing"
+    return f"denied ({detail})"
+
+
 def notify(title: str, message: str, args: argparse.Namespace) -> None:
     if not getattr(args, "notify", True):
+        return
+    if IS_MACOS:
+        try:
+            run_osascript(MACOS_NOTIFY_SCRIPT, title, message, timeout=10.0)
+        except Exception:
+            pass
         return
     notify_send = shutil.which("notify-send")
     if not notify_send or not os.getenv("DISPLAY"):
@@ -359,6 +445,8 @@ def write_pid(path: Path = PID_FILE) -> None:
 
 
 def display_server() -> str:
+    if IS_MACOS:
+        return "macos"
     session_type = os.getenv("XDG_SESSION_TYPE", "").lower()
     if session_type in ("wayland", "x11"):
         return session_type
@@ -369,12 +457,51 @@ def display_server() -> str:
     return "unknown"
 
 
+def macos_pasteboard_write(text: str) -> bool:
+    """Put text on the pasteboard through AppKit rather than pbcopy.
+
+    pbcopy means handing bytes to another process and trusting it to decode them with the
+    encoding we meant. Inside an app bundle that negotiation goes wrong and non-ASCII text
+    arrives as UTF-8 read through Mac OS Roman. Going through NSPasteboard passes a string
+    across the bridge with no byte encoding anywhere in the path, so there is nothing to
+    disagree about. Returns False when AppKit is unavailable, as in the plain CLI.
+    """
+
+    try:
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+    except ImportError:
+        return False
+    pasteboard = NSPasteboard.generalPasteboard()
+    pasteboard.clearContents()
+    return bool(pasteboard.setString_forType_(text, NSPasteboardTypeString))
+
+
+def macos_pasteboard_read() -> Optional[str]:
+    """Read the pasteboard through AppKit. None means AppKit is unavailable."""
+
+    try:
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+    except ImportError:
+        return None
+    value = NSPasteboard.generalPasteboard().stringForType_(NSPasteboardTypeString)
+    return "" if value is None else str(value)
+
+
 def copy_to_clipboard(text: str) -> bool:
+    if IS_MACOS:
+        if macos_pasteboard_write(text):
+            return True
+        pbcopy = shutil.which("pbcopy")
+        if not pbcopy:
+            return False
+        subprocess.run([pbcopy], input=text, text=True, encoding="utf-8", check=True)
+        return True
+
     if display_server() == "wayland":
         wl_copy = shutil.which("wl-copy")
         if not os.getenv("WAYLAND_DISPLAY") or not wl_copy:
             return False
-        subprocess.run([wl_copy], input=text, text=True, check=True)
+        subprocess.run([wl_copy], input=text, text=True, encoding="utf-8", check=True)
         return True
 
     xclip = shutil.which("xclip")
@@ -383,13 +510,33 @@ def copy_to_clipboard(text: str) -> bool:
     subprocess.run(
         [xclip, "-selection", "clipboard"],
         input=text,
-        text=True,
+        text=True, encoding="utf-8",
         check=True,
     )
     return True
 
 
+def macos_keystroke(text: str, *, command: bool = False, timeout: float = 60.0) -> bool:
+    script = MACOS_COMMAND_KEY_SCRIPT if command else MACOS_KEYSTROKE_SCRIPT
+    result = run_osascript(script, text, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(osascript_error(result))
+    return True
+
+
+def macos_paste(text: str) -> bool:
+    if not copy_to_clipboard(text):
+        return False
+    time.sleep(0.15)
+    return macos_keystroke("v", command=True, timeout=15.0)
+
+
 def type_text(text: str, args: argparse.Namespace) -> bool:
+    if IS_MACOS:
+        # System Events types the whole string at its own pace, so --type-delay has
+        # no effect here. Long transcripts are much faster through --output-method paste.
+        return macos_keystroke(text)
+
     if display_server() == "wayland":
         ydotool = shutil.which("ydotool")
         if not ydotool:
@@ -419,6 +566,11 @@ def type_text(text: str, args: argparse.Namespace) -> bool:
 
 
 def paste_clipboard(text: str, args: argparse.Namespace, shortcut: str = "ctrl+v") -> bool:
+    if IS_MACOS:
+        # Cmd+V pastes in every macOS app, Terminal and iTerm included, so the
+        # "paste" and "terminal-paste" output methods collapse to one keystroke.
+        return macos_paste(text)
+
     if display_server() == "wayland":
         ydotool = shutil.which("ydotool")
         if not ydotool or not copy_to_clipboard(text):
@@ -459,6 +611,24 @@ def insert_text(text: str, args: argparse.Namespace) -> bool:
 
 
 def read_x_selection(selection: str) -> str:
+    if IS_MACOS:
+        # macOS has no PRIMARY selection; only the clipboard is readable.
+        if selection != "clipboard":
+            return ""
+        native = macos_pasteboard_read()
+        if native is not None:
+            return native.strip()
+        pbpaste = shutil.which("pbpaste")
+        if not pbpaste:
+            return ""
+        try:
+            result = subprocess.run(
+                [pbpaste], capture_output=True, text=True, encoding="utf-8", check=False, timeout=2.0
+            )
+        except Exception:
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
     if display_server() == "wayland":
         wl_paste = shutil.which("wl-paste")
         if not os.getenv("WAYLAND_DISPLAY") or not wl_paste:
@@ -467,7 +637,7 @@ def read_x_selection(selection: str) -> str:
         if selection == "primary":
             command.append("--primary")
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", check=False)
         except Exception:
             return ""
         return result.stdout.strip() if result.returncode == 0 else ""
@@ -479,7 +649,7 @@ def read_x_selection(selection: str) -> str:
         result = subprocess.run(
             [xclip, "-selection", selection, "-o"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             check=False,
             timeout=1.0,
         )
@@ -490,7 +660,41 @@ def read_x_selection(selection: str) -> str:
     return result.stdout.strip()
 
 
-def selected_or_clipboard_text() -> tuple[str, str]:
+def macos_selected_text() -> tuple[str, str]:
+    """Approximate the X11 PRIMARY selection by copying from the focused app.
+
+    macOS exposes highlighted text only through a copy, so this sends Cmd+C and reads
+    the clipboard. Any previous clipboard contents are put back afterwards, so a
+    --speak-selection call leaves a non-empty clipboard as it found it.
+    """
+    before = read_x_selection("clipboard")
+    try:
+        macos_keystroke("c", command=True, timeout=15.0)
+    except Exception:
+        return "", ""
+    time.sleep(0.2)
+    after = read_x_selection("clipboard")
+    if not after or after == before:
+        return "", ""
+    if before:
+        try:
+            copy_to_clipboard(before)
+        except Exception:
+            pass
+    return after, "selection"
+
+
+def selected_or_clipboard_text(copy_selection: bool = True) -> tuple[str, str]:
+    if IS_MACOS:
+        if copy_selection:
+            text, source = macos_selected_text()
+            if text:
+                return text, source
+        clipboard = read_x_selection("clipboard")
+        if clipboard:
+            return clipboard, "clipboard"
+        return "", ""
+
     primary = read_x_selection("primary")
     if primary:
         return primary, "selection"
@@ -514,8 +718,101 @@ async def synthesize_edge_tts(text: str, output_path: Path, args: argparse.Names
     await communicate.save(str(output_path))
 
 
+# espeak-ng aborts the whole process when it cannot read its data files, so the probe
+# below runs in a child interpreter and only the exit status is trusted.
+ESPEAK_PROBE_CODE = """
+import ctypes
+import sys
+
+library, data_path = sys.argv[1], sys.argv[2] or None
+espeak = ctypes.cdll.LoadLibrary(library)
+# espeak_Initialize takes a const char *, so the data path has to be declared and
+# encoded. Handing ctypes a str instead passes a wchar_t *, which the library reads
+# as a one-character path, and the probe would then fail for the wrong reason.
+espeak.espeak_Initialize.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+espeak.espeak_Initialize.restype = ctypes.c_int
+# AUDIO_OUTPUT_SYNCHRONOUS; returns the sample rate on success and -1 on failure.
+sys.exit(0 if espeak.espeak_Initialize(0x02, 0, data_path.encode() if data_path else None, 0) > 0 else 1)
+"""
+
+
+def espeak_library_usable(library: str | os.PathLike[str], data_path: Optional[str] = None) -> bool:
+    """Whether espeak-ng can be loaded *and* initialized from this library."""
+
+    argv = [sys.executable, "-I", "-c", ESPEAK_PROBE_CODE, str(library), str(data_path or "")]
+    try:
+        completed = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def bundled_espeak_paths() -> Optional[tuple[str, str]]:
+    """The espeak-ng library and data directory that kokoro-onnx carries, if present."""
+
+    try:
+        import espeakng_loader
+    except ImportError:
+        return None
+
+    try:
+        return str(espeakng_loader.get_library_path()), str(espeakng_loader.get_data_path())
+    except Exception:
+        return None
+
+
+def ensure_macos_espeak_library() -> Optional[str]:
+    """Make sure the kokoro-onnx phonemizer can find a working espeak-ng library on macOS.
+
+    kokoro-onnx resolves espeak-ng through the espeakng-loader wheel and only consults
+    PHONEMIZER_ESPEAK_LIBRARY as an override. On macOS the wheel's libespeak-ng.dylib
+    loads but ignores the data directory it is handed and looks for its own build-time
+    path instead, which kills the process. The bundled copy is therefore probed rather
+    than trusted, and the Homebrew library is exported before kokoro_onnx is imported
+    when the probe fails, so the dylib never has to be pointed at by hand.
+
+    Returns the path that was exported, or None when nothing had to be changed.
+    """
+
+    if not IS_MACOS:
+        return None
+
+    if os.getenv("PHONEMIZER_ESPEAK_LIBRARY"):
+        # An explicit override wins; a broken one is the caller's to fix.
+        return None
+
+    bundled = bundled_espeak_paths()
+    if bundled and espeak_library_usable(*bundled):
+        return None
+
+    for lib_dir in MACOS_ESPEAK_LIB_DIRS:
+        for lib_name in MACOS_ESPEAK_LIB_NAMES:
+            candidate = Path(lib_dir) / lib_name
+            # The data directory stays unset so the library falls back to its own.
+            if candidate.exists() and espeak_library_usable(candidate):
+                os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = str(candidate)
+                return str(candidate)
+
+    found = ctypes.util.find_library("espeak-ng") or ctypes.util.find_library("espeak")
+    if found and espeak_library_usable(found):
+        os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = found
+        return found
+
+    print(MACOS_ESPEAK_HINT, file=sys.stderr)
+    return None
+
+
 def synthesize_kokoro_tts(text: str, output_path: Path, args: argparse.Namespace) -> None:
     import soundfile as sf
+
+    ensure_macos_espeak_library()
+
     from kokoro_onnx import Kokoro
 
     model_path = Path(args.kokoro_model).expanduser()
@@ -552,6 +849,14 @@ def tts_audio_suffix(args: argparse.Namespace) -> str:
 
 
 def play_tts_audio(audio_path: Path) -> None:
+    if IS_MACOS:
+        # afplay ships with macOS and handles both the WAV and MP3 output, so ffmpeg
+        # stays optional here.
+        afplay = shutil.which("afplay")
+        if afplay:
+            subprocess.run([afplay, str(audio_path)], check=True, stdin=subprocess.DEVNULL)
+            return
+
     ffplay = shutil.which("ffplay")
     if not ffplay:
         raise RuntimeError("ffplay is required to play TTS audio")
@@ -653,7 +958,7 @@ def speak_selection(args: argparse.Namespace) -> int:
     if pid:
         remove_pid(pid, TTS_PID_FILE)
 
-    text, source = selected_or_clipboard_text()
+    text, source = selected_or_clipboard_text(getattr(args, "macos_copy_selection", True))
     if not text:
         notify("Voice TTS", "No selected text or clipboard text.", args)
         print("No selected text or clipboard text.")
@@ -747,6 +1052,25 @@ def print_tts_voices(args: argparse.Namespace) -> int:
     return 0
 
 
+def espeak_library_report() -> str:
+    """One-line summary of which espeak-ng library the Kokoro backend will phonemize with."""
+
+    override = os.getenv("PHONEMIZER_ESPEAK_LIBRARY")
+    if override:
+        state = "works" if espeak_library_usable(override) else "does not initialize"
+        return f"{override} (PHONEMIZER_ESPEAK_LIBRARY, {state})"
+
+    bundled = bundled_espeak_paths()
+    if bundled and espeak_library_usable(*bundled):
+        return f"{bundled[0]} (bundled with kokoro-onnx)"
+
+    resolved = ensure_macos_espeak_library()
+    if resolved:
+        return f"{resolved} (system library, exported automatically)"
+
+    return "missing"
+
+
 def print_tts_check(args: argparse.Namespace) -> int:
     import importlib.metadata as importlib_metadata
 
@@ -771,12 +1095,32 @@ def print_tts_check(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"kokoro voice count: unavailable ({exc})")
         print(f"secondary voice: {SECONDARY_KOKORO_VOICE}")
+        print(f"espeak-ng library: {espeak_library_report()}")
     print(f"edge-tts: {version('edge-tts')}")
     print(f"kokoro-onnx: {version('kokoro-onnx')}")
     print(f"soundfile: {version('soundfile')}")
+    print_platform_tools()
+    return 0
+
+
+def print_platform_tools() -> None:
+    print(f"platform: {sys.platform}")
+    print(f"display server: {display_server()}")
+    if IS_MACOS:
+        print(f"afplay: {shutil.which('afplay') or 'missing'}")
+        print(f"ffplay: {shutil.which('ffplay') or 'optional on macOS (afplay is preferred)'}")
+        print(f"pbcopy: {shutil.which('pbcopy') or 'missing'}")
+        print(f"pbpaste: {shutil.which('pbpaste') or 'missing'}")
+        print(f"osascript: {shutil.which('osascript') or 'missing'}")
+        print(f"skhd: {shutil.which('skhd') or 'missing (needed for --install-hotkeys)'}")
+        print(f"accessibility: {macos_accessibility_status()}")
+        return
     print(f"ffplay: {shutil.which('ffplay') or 'missing'}")
     print(f"xclip: {shutil.which('xclip') or 'missing'}")
-    return 0
+    print(f"wl-copy: {shutil.which('wl-copy') or 'missing'}")
+    print(f"xdotool: {shutil.which('xdotool') or 'missing'}")
+    print(f"ydotool: {shutil.which('ydotool') or 'missing'}")
+    print(f"notify-send: {shutil.which('notify-send') or 'missing'}")
 
 
 def background_argv(args: argparse.Namespace) -> list[str]:
@@ -937,7 +1281,7 @@ def install_gnome_hotkey() -> int:
     result = subprocess.run(
         ["gsettings", "get", media_schema, "custom-keybindings"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         check=True,
     )
     bindings = parse_gsettings_list(result.stdout)
@@ -957,6 +1301,96 @@ def install_gnome_hotkey() -> int:
     print(f"Installed GNOME shortcut Super+B -> {stt_command}")
     print(f"Installed GNOME shortcut Super+T -> {tts_command}")
     return 0
+
+
+def resolve_voice_command() -> str:
+    """Return a shell-ready command that runs this voicemode installation.
+
+    skhd hands its commands to a shell, so every path is quoted. The console script
+    living beside the running interpreter is preferred over PATH, because a
+    virtualenv that is not activated would otherwise resolve to a different install.
+    """
+    candidate = Path(sys.executable).parent / "voicemode"
+    if candidate.exists():
+        return shlex.quote(str(candidate))
+    installed = shutil.which("voicemode") or shutil.which("voice")
+    if installed:
+        return shlex.quote(installed)
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))}"
+
+
+def skhd_hotkey_block(voice_cmd: str) -> str:
+    return "\n".join(
+        [
+            SKHD_BEGIN,
+            f"{MACOS_STT_BINDING} : {voice_cmd} --toggle",
+            f"{MACOS_TTS_BINDING} : {voice_cmd} --speak-selection",
+            SKHD_END,
+        ]
+    )
+
+
+def start_skhd_service(skhd: str) -> tuple[bool, str]:
+    restart = subprocess.run([skhd, "--restart-service"], capture_output=True, text=True, encoding="utf-8", check=False)
+    if restart.returncode == 0:
+        return True, "restarted"
+    install = subprocess.run([skhd, "--install-service"], capture_output=True, text=True, encoding="utf-8", check=False)
+    start = subprocess.run([skhd, "--start-service"], capture_output=True, text=True, encoding="utf-8", check=False)
+    if start.returncode == 0:
+        return True, "installed and started"
+    detail = (start.stderr or start.stdout or install.stderr or "").strip()
+    return False, detail or f"skhd --start-service exited {start.returncode}"
+
+
+def install_macos_hotkeys() -> int:
+    skhd = shutil.which("skhd")
+    if not skhd:
+        print(
+            "skhd not found. skhd lives in a third-party tap, so it takes three steps: "
+            "brew tap koekeishiya/formulae && brew trust --formula koekeishiya/formulae/skhd "
+            "&& brew install koekeishiya/formulae/skhd",
+            file=sys.stderr,
+        )
+        return 1
+
+    voice_cmd = resolve_voice_command()
+    block = skhd_hotkey_block(voice_cmd)
+    existing = SKHD_CONFIG.read_text(encoding="utf-8") if SKHD_CONFIG.exists() else ""
+    marker = re.compile(rf"{re.escape(SKHD_BEGIN)}.*?{re.escape(SKHD_END)}\n?", re.DOTALL)
+    if marker.search(existing):
+        updated = marker.sub(block + "\n", existing)
+        action = "Updated"
+    else:
+        prefix = existing if (not existing or existing.endswith("\n")) else existing + "\n"
+        updated = f"{prefix}{block}\n"
+        action = "Added"
+    SKHD_CONFIG.write_text(updated, encoding="utf-8")
+
+    print(f"{action} voicemode bindings in {SKHD_CONFIG}")
+    print(f"Installed shortcut {MACOS_STT_LABEL} -> {voice_cmd} --toggle")
+    print(f"Installed shortcut {MACOS_TTS_LABEL} -> {voice_cmd} --speak-selection")
+
+    ok, detail = start_skhd_service(skhd)
+    if ok:
+        print(f"skhd service {detail}.")
+    else:
+        print(f"skhd service did not start: {detail}", file=sys.stderr)
+        print(f"Start it by hand with: {skhd} --start-service", file=sys.stderr)
+
+    print("")
+    print("macOS still needs two permissions before the hotkeys work:")
+    print("  1. System Settings > Privacy & Security > Accessibility: enable skhd")
+    print("     (required so voicemode can type or paste the transcript)")
+    print("  2. System Settings > Privacy & Security > Microphone: enable skhd")
+    print("     (required so the background recorder can reach the microphone)")
+    print("Run `voicemode --check` afterwards to confirm the Accessibility grant.")
+    return 0 if ok else 1
+
+
+def install_hotkeys() -> int:
+    if IS_MACOS:
+        return install_macos_hotkeys()
+    return install_gnome_hotkey()
 
 
 def print_status() -> int:
@@ -1089,8 +1523,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--watch", action="store_true", help="Watch global hotkey activity in this terminal.")
     parser.add_argument("--terminal", action="store_true", help="Use terminal-only Ctrl+B recording mode.")
     parser.add_argument("--status", action="store_true", help="Print whether background recording is active.")
-    parser.add_argument("--install-hotkey", action="store_true", help="Install GNOME Super+B and Super+T shortcuts.")
-    parser.add_argument("--install-hotkeys", action="store_true", help="Install GNOME Super+B and Super+T shortcuts.")
+    parser.add_argument(
+        "--install-hotkey",
+        action="store_true",
+        help="Install global shortcuts: GNOME keybindings on Linux, skhd bindings on macOS.",
+    )
+    parser.add_argument(
+        "--install-hotkeys",
+        action="store_true",
+        help="Install global shortcuts: GNOME keybindings on Linux, skhd bindings on macOS.",
+    )
     parser.add_argument("--record-background", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--speak-selection", action="store_true", help="Speak selected text, falling back to clipboard text.")
     parser.add_argument("--speak", metavar="TEXT", help="Speak the provided text using TTS.")
@@ -1145,17 +1587,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-method",
         choices=("type", "paste", "terminal-paste", "clipboard"),
-        default=os.getenv("VOICE_OUTPUT_METHOD", "type"),
-        help="How background mode inserts the transcript. Default: type.",
+        default=os.getenv("VOICE_OUTPUT_METHOD", "paste" if IS_MACOS else "type"),
+        help="How background mode inserts the transcript. Default: paste on macOS, type on Linux.",
     )
     parser.add_argument(
         "--type-delay",
         type=int,
         default=int(os.getenv("VOICE_TYPE_DELAY", "2")),
-        help="Milliseconds between synthetic keystrokes for --output-method type.",
+        help="Milliseconds between synthetic keystrokes for --output-method type. Ignored on macOS.",
     )
     parser.add_argument("--paste", dest="paste", action="store_true", default=True, help="Insert transcript into the focused app.")
     parser.add_argument("--no-paste", dest="paste", action="store_false", help="Do not insert after background transcription.")
+    parser.add_argument(
+        "--macos-copy-selection",
+        dest="macos_copy_selection",
+        action="store_true",
+        default=os.getenv("VOICE_MACOS_COPY_SELECTION", "true").strip().lower() not in ("0", "false", "no"),
+        help="On macOS, send Cmd+C before --speak-selection to capture highlighted text. Default.",
+    )
+    parser.add_argument(
+        "--no-macos-copy-selection",
+        dest="macos_copy_selection",
+        action="store_false",
+        help="On macOS, read only the existing clipboard for --speak-selection.",
+    )
     parser.add_argument("--notify", dest="notify", action="store_true", default=True, help="Show desktop notifications.")
     parser.add_argument("--no-notify", dest="notify", action="store_false", help="Disable desktop notifications.")
     parser.add_argument("--beep", dest="beep", action="store_true", default=env_bool("VOICE_BEEP", True), help="Play audible recording cues.")
@@ -1206,7 +1661,7 @@ def main() -> int:
         print(sd.query_devices())
         return 0
     if args.install_hotkey or args.install_hotkeys:
-        return install_gnome_hotkey()
+        return install_hotkeys()
     if args.status:
         return print_status()
     if args.toggle:
@@ -1221,6 +1676,7 @@ def main() -> int:
 
     if args.check:
         load_model(args)
+        print_platform_tools()
         return 0
     if args.terminal:
         return run_terminal_mode(args)

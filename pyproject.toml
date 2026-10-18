@@ -5,20 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "voicemode"
 version = "0.1.0"
-description = "Desktop-global speech-to-text and text-to-speech hotkeys for Linux."
+description = "Desktop-global speech-to-text and text-to-speech hotkeys for Linux and macOS."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [
   { name = "voicemode contributors" }
 ]
-keywords = ["speech-to-text", "text-to-speech", "linux", "gnome", "x11", "whisper", "kokoro"]
+keywords = ["speech-to-text", "text-to-speech", "linux", "macos", "gnome", "x11", "skhd", "whisper", "kokoro"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: X11 Applications",
+  "Environment :: MacOS X",
   "Intended Audience :: End Users/Desktop",
   "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS :: MacOS X",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Topic :: Multimedia :: Sound/Audio :: Speech",
@@ -39,18 +41,28 @@ kokoro = [
 edge = [
   "edge-tts>=7.2.7"
 ]
+app = [
+  "kokoro-onnx==0.5.0",
+  "soundfile>=0.14.0",
+  "pyobjc-core>=10.3",
+  "pyobjc-framework-Cocoa>=10.3",
+  "py2app>=0.28.8"
+]
 all = [
   "kokoro-onnx==0.5.0",
   "soundfile>=0.14.0",
   "edge-tts>=7.2.7"
 ]
 
+[project.gui-scripts]
+voicemode-app = "voiceapp:main"
+
 [project.scripts]
 voicemode = "voice:main"
 voice = "voice:main"
 
 [tool.setuptools]
-py-modules = ["voice"]
+py-modules = ["voice", "voiceapp"]
 
 [tool.ruff]
 line-length = 120
